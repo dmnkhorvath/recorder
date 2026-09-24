@@ -98,6 +98,24 @@ final class SystemAudioTap {
     /// a session; read by `stop()` after the writer has been joined.
     private var capturedFrames: AVAudioFramePosition = 0
 
+    // --- Timeline sync (touched only on the IO thread while running; reset in start()). ---
+    // The desktop file must advance in lock-step with wall-clock host time, otherwise any
+    // interruption of the tap (watchdog rebuilds, device hiccups) silently shortens the file and
+    // the desktop track drifts ahead of the mic in the final mix. We compare the frames enqueued
+    // so far against the host-time position of each IO buffer and insert silence (or skip frames)
+    // whenever they diverge by more than `syncToleranceFrames`.
+    private var timelineFrames: Int64 = 0   // frames enqueued, including inserted silence
+    private var timelineOffset: Int64 = 0   // host-time frames excluded from the timeline (pauses)
+    private var wasPaused = false
+    private var zeros: UnsafeMutablePointer<Float>?
+    private let syncToleranceFrames: Int64 = 960          // 20 ms @ 48 kHz
+    private let maxPadPerCallback = 96_000                 // stay well inside the 4 s ring
+    private var padEvents = 0
+    private var paddedFrames: Int64 = 0
+    private var skipEvents = 0
+    private var skippedFrames: Int64 = 0
+    private var rebuildCount = 0
+
     // MARK: - Off-realtime disk writer (ring buffer + consumer thread)
 
     /// Filled by the IOProc (producer), drained by `writerThread` (consumer).
@@ -162,6 +180,10 @@ final class SystemAudioTap {
         tapUUID = UUID()
         firstHostTime = nil
         capturedFrames = 0
+        timelineFrames = 0
+        timelineOffset = 0
+        wasPaused = false
+        padEvents = 0; paddedFrames = 0; skipEvents = 0; skippedFrames = 0; rebuildCount = 0
 
         // 1) Build tap + aggregate and read the tap format.
         let built = try buildTapAndAggregateLocked()
@@ -212,6 +234,9 @@ final class SystemAudioTap {
         let newRing = FloatRingBuffer(capacityFrames: ringFrames)
         self.ring = newRing
         self.scratch = UnsafeMutablePointer<Float>.allocate(capacity: scratchCapacity)
+        let z = UnsafeMutablePointer<Float>.allocate(capacity: scratchCapacity)
+        z.initialize(repeating: 0, count: scratchCapacity)
+        self.zeros = z
         writerShouldStop.withLock { $0 = false }
         startWriterThread(file: self.file!, writeFormat: writeFmt, ring: newRing)
 
@@ -223,6 +248,8 @@ final class SystemAudioTap {
             self.ring = nil
             self.scratch?.deallocate()
             self.scratch = nil
+            self.zeros?.deallocate()
+            self.zeros = nil
             file = nil   // finalize/close the just-opened file
             destroyTapAndAggregateLocked()
             throw error
@@ -269,9 +296,13 @@ final class SystemAudioTap {
         if let dropped = ring?.totalDropped, dropped > 0 {
             Self.log.error("desktop tap dropped \(dropped) frames (consumer fell behind)")
         }
+        writeSyncReportLocked()
+
         ring = nil
         scratch?.deallocate()
         scratch = nil
+        zeros?.deallocate()
+        zeros = nil
 
         // Finalize the file (setting nil flushes + closes — last reference now).
         file = nil
@@ -283,6 +314,27 @@ final class SystemAudioTap {
             sampleRate: capturedSampleRate,
             frameCount: capturedFrames
         )
+    }
+
+    /// Write a small JSON diagnostics file next to the desktop recording. Caller holds `lock`.
+    private func writeSyncReportLocked() {
+        guard let url = destinationURL else { return }
+        let rate = capturedSampleRate > 0 ? capturedSampleRate : 48_000
+        let report: [String: Any] = [
+            "sampleRate": rate,
+            "timelineFrames": timelineFrames,
+            "paddedFrames": paddedFrames,
+            "paddedSeconds": Double(paddedFrames) / rate,
+            "padEvents": padEvents,
+            "skippedFrames": skippedFrames,
+            "skipEvents": skipEvents,
+            "watchdogRebuilds": rebuildCount,
+            "ringDroppedFrames": ring?.totalDropped ?? 0
+        ]
+        let out = url.deletingLastPathComponent().appendingPathComponent("desktop-sync.json")
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: out)
+        }
     }
 
     // MARK: - Build / teardown (must hold `lock`)
@@ -474,6 +526,7 @@ final class SystemAudioTap {
 
         // --- Honor pause gate (meters keep updating above; only the write is gated). ---
         if paused.withLock({ $0 }) {
+            wasPaused = true
             return
         }
 
@@ -492,9 +545,45 @@ final class SystemAudioTap {
             firstHostTime = inputTime.pointee.mHostTime
         }
 
+        // --- Keep the file on the wall-clock timeline (see `timelineFrames`). ---
+        var skip = 0
+        if let first = firstHostTime, inputTime.pointee.mFlags.contains(.hostTimeValid) {
+            let t = inputTime.pointee.mHostTime
+            let elapsedNanos = t >= first ? Self.hostTimeToNanos(t - first) : 0
+            let expected = Int64((Double(elapsedNanos) * tapFormat.sampleRate / 1_000_000_000).rounded())
+            if wasPaused {
+                // Paused time is excluded from both tracks (the mic gates writes too), so re-base
+                // instead of filling the pause with silence.
+                timelineOffset = expected - timelineFrames
+                wasPaused = false
+            }
+            let drift = expected - timelineOffset - timelineFrames
+            if drift > syncToleranceFrames, let zeros = self.zeros {
+                // Frames are missing (tap interrupted): fill the hole with silence.
+                var remaining = min(Int(drift), maxPadPerCallback)
+                let padded = Int64(remaining)
+                while remaining > 0 {
+                    let c = min(remaining, scratchCapacity)
+                    ring.write(zeros, count: c)
+                    remaining -= c
+                }
+                timelineFrames += padded
+                padEvents += 1
+                paddedFrames += padded
+            } else if drift < -syncToleranceFrames {
+                // More frames than wall-clock time: drop the surplus from this buffer.
+                skip = min(Int(-drift), Int(frameCount))
+                skipEvents += 1
+                skippedFrames += Int64(skip)
+            }
+        }
+        timelineFrames += Int64(Int(frameCount) - skip)
+
         if channelCount <= 1 {
             // Already mono: enqueue straight from the input buffer.
-            ring.write(channelData[0], count: Int(frameCount))
+            if skip < Int(frameCount) {
+                ring.write(channelData[0] + skip, count: Int(frameCount) - skip)
+            }
         } else if let scratch = self.scratch {
             // Average all channels into mono, in scratch-sized chunks (IO buffers are tiny, so
             // this loop runs once in practice).
@@ -506,7 +595,7 @@ final class SystemAudioTap {
             let interleaved = tapFormat.isInterleaved
             let stride = vDSP_Stride(channelCount)
             let total = Int(frameCount)
-            var offset = 0
+            var offset = skip
             while offset < total {
                 let chunk = min(total - offset, scratchCapacity)
                 let cn = vDSP_Length(chunk)
@@ -638,6 +727,7 @@ final class SystemAudioTap {
 
         // Destroy existing Core Audio objects (leaves `file` untouched).
         destroyTapAndAggregateLocked()
+        rebuildCount += 1
 
         // Fresh tap UUID for the rebuild.
         tapUUID = UUID()
