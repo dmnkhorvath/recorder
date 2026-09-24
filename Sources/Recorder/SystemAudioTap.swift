@@ -165,6 +165,7 @@ final class SystemAudioTap {
 
         // 1) Build tap + aggregate and read the tap format.
         let built = try buildTapAndAggregateLocked()
+        Self.log.notice("tap format: \(built.tapFormat.sampleRate, privacy: .public) Hz, \(built.tapFormat.channelCount, privacy: .public) ch, interleaved=\(built.tapFormat.isInterleaved, privacy: .public)")
 
         // 2) Open the destination file MONO Float32 at the tap's sample rate.
         guard let writeFmt = AVAudioFormat(
@@ -497,14 +498,30 @@ final class SystemAudioTap {
         } else if let scratch = self.scratch {
             // Average all channels into mono, in scratch-sized chunks (IO buffers are tiny, so
             // this loop runs once in practice).
+            //
+            // The tap usually delivers INTERLEAVED stereo (one buffer, L R L R ...). In that case
+            // `floatChannelData` holds a single pointer and samples must be read with a stride of
+            // `channelCount`. Treating it as planar wrote L/R pairs as consecutive mono samples,
+            // which halved every IO buffer and produced heavily distorted desktop audio.
+            let interleaved = tapFormat.isInterleaved
+            let stride = vDSP_Stride(channelCount)
             let total = Int(frameCount)
             var offset = 0
             while offset < total {
                 let chunk = min(total - offset, scratchCapacity)
                 let cn = vDSP_Length(chunk)
-                memcpy(scratch, channelData[0] + offset, chunk * MemoryLayout<Float>.stride)
-                for ch in 1..<channelCount {
-                    vDSP_vadd(scratch, 1, channelData[ch] + offset, 1, scratch, 1, cn)
+                if interleaved {
+                    let base = channelData[0] + offset * channelCount
+                    var one: Float = 1
+                    vDSP_vsmul(base, stride, &one, scratch, 1, cn)
+                    for ch in 1..<channelCount {
+                        vDSP_vadd(scratch, 1, base + ch, stride, scratch, 1, cn)
+                    }
+                } else {
+                    memcpy(scratch, channelData[0] + offset, chunk * MemoryLayout<Float>.stride)
+                    for ch in 1..<channelCount {
+                        vDSP_vadd(scratch, 1, channelData[ch] + offset, 1, scratch, 1, cn)
+                    }
                 }
                 var scale = 1.0 / Float(channelCount)
                 vDSP_vsmul(scratch, 1, &scale, scratch, 1, cn)
